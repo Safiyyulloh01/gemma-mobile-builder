@@ -1,0 +1,288 @@
+name: Gemma Mobile Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: 'Hugging Face model ID'
+        required: true
+        default: 'principled-intelligence/gemma-4-E2B-it-text-only'
+      hf_token:
+        description: 'Hugging Face token (license-gated models)'
+        required: true
+        type: string
+      quantization:
+        description: 'Quantization type'
+        required: true
+        default: 'q4_k_m'
+        type: choice
+        options:
+          - q4_k_m
+          - q4_0
+          - q5_k_m
+          - q8_0
+      target_backend:
+        description: 'Target backend'
+        required: true
+        default: 'cpu'
+        type: choice
+        options:
+          - cpu             # llama.cpp GGUF (fastest path, works everywhere)
+          - qnn_npu         # Qualcomm NPU (QNN SDK, requires SDK secrets)
+          - both
+      android_abi:
+        description: 'Android ABI'
+        required: true
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - arm64-v8a
+          - all
+
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'android/**'
+
+env:
+  MODEL_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model_id || 'principled-intelligence/gemma-4-E2B-it-text-only' }}
+  QUANT_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.quantization || 'q4_k_m' }}
+  TARGET_BACKEND: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_backend || 'cpu' }}
+  ANDROID_ABI: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.android_abi || 'arm64-v8a' }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  QNN_SDK_VERSION: "2.28.0.250409"
+
+jobs:
+  # ── Job 1: Model conversion ──────────────────────────────────────
+  convert_model:
+    runs-on: ubuntu-22.04
+    outputs:
+      gguf_path: ${{ steps.export.outputs.gguf_path }}
+      onnx_path: ${{ steps.export.outputs.onnx_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build build-essential \
+            python3 python3-venv git-lfs
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Login to Hugging Face
+        env:
+          HF_TOKEN: ${{ env.HF_TOKEN }}
+        run: |
+          python3 -m pip install -q huggingface_hub
+          huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+
+      - name: Download model from Hugging Face
+        run: |
+          mkdir -p models/original
+          python3 scripts/download_model.py \
+            --model-id "$MODEL_ID" \
+            --output-dir models/original \
+            --token "$HF_TOKEN"
+
+      - name: Convert to GGUF (CPU path)
+        id: export
+        run: |
+          mkdir -p models/gguf
+          if [ "$TARGET_BACKEND" = "cpu" ] || [ "$TARGET_BACKEND" = "both" ]; then
+            bash scripts/convert_to_gguf.sh \
+              --input-dir models/original \
+              --output-dir models/gguf \
+              --quant-type "$QUANT_TYPE"
+            echo "gguf_path=models/gguf" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Export to ONNX (QNN NPU path)
+        run: |
+          if [ "$TARGET_BACKEND" = "qnn_npu" ] || [ "$TARGET_BACKEND" = "both" ]; then
+            mkdir -p models/onnx
+            bash scripts/export_onnx.sh \
+              --model-id "$MODEL_ID" \
+              --output-dir models/onnx
+            echo "onnx_path=models/onnx" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: models/
+          retention-days: 7
+
+  # ── Job 2: Build llama.cpp Android libraries ──────────────────
+  build_llamacpp_android:
+    needs: convert_model
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Build llama.cpp for Android
+        run: |
+          bash scripts/build_llamacpp_android.sh \
+            --ndk-dir "${{ steps.setup-ndk.outputs.ndk-path }}" \
+            --abi "${{ matrix.abi }}" \
+            --output-dir "android/native/libs/${{ matrix.abi }}"
+
+      - name: Upload native libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-android-${{ matrix.abi }}
+          path: android/native/libs/${{ matrix.abi }}/
+          retention-days: 7
+
+  # ── Job 3: QNN SDK optimization (requires SDK zip) ──────────
+  optimize_qnn:
+    needs: convert_model
+    runs-on: ubuntu-22.04
+    if: env.TARGET_BACKEND == 'qnn_npu' || env.TARGET_BACKEND == 'both'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: models/
+
+      - name: Extract QNN SDK
+        run: |
+          bash scripts/setup_qnn_sdk.sh \
+            --output-dir tools/qnn \
+            --version "$QNN_SDK_VERSION"
+
+      - name: Run QNN model optimization
+        run: |
+          # QNN context-gen: converts ONNX → QNN binary for Snapdragon NPU
+          python3 scripts/optimize_qnn.py \
+            --qnn-sdk tools/qnn \
+            --onnx-path models/onnx \
+            --output-dir android/native/libs/arm64-v8a \
+            --soc-family "snapdragon-8-gen3"
+
+      - name: Upload QNN context binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: qnn-context-binaries
+          path: android/native/libs/
+          retention-days: 7
+
+  # ── Job 4: Assemble Android APK ──────────────────────────────
+  assemble_apk:
+    needs: [build_llamacpp_android, optimize_qnn]
+    runs-on: ubuntu-22.04
+    if: always() && !cancelled()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all native libs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: llama-android-*
+          path: android/native/libs/
+          merge-multiple: true
+
+      - name: Download QNN binaries (if built)
+        uses: actions/download-artifact@v4
+        with:
+          name: qnn-context-binaries
+          path: android/native/libs/
+          continue-on-error: true
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: models/
+
+      - name: Set up Java & Android SDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build APK with Gradle
+        working-directory: android
+        run: |
+          # Copy quantized model into assets
+          mkdir -p app/src/main/assets/models/
+          cp ../models/gguf/gemma-4-e2b-q4_k_m.gguf app/src/main/assets/models/
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Sign APK
+        run: |
+          bash scripts/sign_apk.sh \
+            --apk-path android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            --keystore "${{ secrets.ANDROID_KEYSTORE }}" \
+            --key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            --key-password "${{ secrets.ANDROID_KEY_PASSWORD }}" \
+            --output-dir android/dist/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemma-mobile-apk
+          path: android/dist/
+          retention-days: 30
+
+  # ── Job 5: Publish release ──────────────────────────────────
+  publish_release:
+    needs: assemble_apk
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gemma-mobile-apk
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "mobile-${{ github.run_number }}"
+          name: "Gemma Mobile Build #${{ github.run_number }}"
+          body: |
+            ## Gemma-4-E2B Mobile Build
+
+            - **Model:** ${{ env.MODEL_ID }}
+            - **Quantization:** ${{ env.QUANT_TYPE }}
+            - **Backend:** ${{ env.TARGET_BACKEND }}
+            - **ABI:** ${{ env.ANDROID_ABI }}
+
+            ### APK
+            - `gemma-mobile.apk` — signed release APK
+            - Bundles quantized model + native inference engine
+
+            ### Usage
+            1. Install APK on device
+            2. Open app → model auto-loads
+            3. Enter prompt → runs locally on-device
+
+            > Built by Gemma Mobile Builder CI
+          files: |
+            dist/gemma-mobile.apk
